@@ -594,6 +594,7 @@ async fn show_provide_progress(
                     ProviderMessage::ClientConnectedNotify(msg) => {
                         let node_id = msg.node_id.map(|id| id.fmt_short().to_string()).unwrap_or_else(|| "?".to_string());
                         let connection_id = msg.connection_id;
+                        eprintln!("Node {} connected with connection {}", node_id, connection_id);
                         connections.lock().unwrap().insert(
                             connection_id,
                             PerConnectionProgress {
@@ -604,6 +605,7 @@ async fn show_provide_progress(
                     }
                     ProviderMessage::ConnectionClosed(msg) => {
                         if let Some(connection) = connections.lock().unwrap().remove(&msg.connection_id) {
+                            eprintln!("Connection {} disconnected", msg.connection_id);
                             for pb in connection.requests.values() {
                                 pb.finish_and_clear();
                                 mp.remove(pb);
