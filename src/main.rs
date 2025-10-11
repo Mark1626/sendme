@@ -684,6 +684,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(&blobs_data_dir2).await?;
 
         let endpoint = builder.bind().await?;
+        eprintln!("Node id {}", endpoint.node_id());
         let draw_target = if args.common.no_progress {
             ProgressDrawTarget::hidden()
         } else {
@@ -1007,6 +1008,7 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
         builder = builder.bind_addr_v6(addr);
     }
     let endpoint = builder.bind().await?;
+    eprintln!("Node id {}", endpoint.node_id());
     let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
     let db = iroh_blobs::store::fs::FsStore::load(&iroh_data_dir).await?;
