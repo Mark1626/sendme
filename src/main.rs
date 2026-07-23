@@ -22,8 +22,9 @@ use indicatif::{
     HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle,
 };
 use iroh::{
-    discovery::{dns::DnsDiscovery, pkarr::PkarrPublisher},
-    Endpoint, NodeAddr, RelayMode, RelayUrl, SecretKey,
+    address_lookup::{dns::DnsAddressLookup, pkarr::PkarrPublisher},
+    endpoint::presets,
+    Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr,
 };
 use iroh_blobs::{
     api::{
@@ -45,7 +46,7 @@ use iroh_blobs::{
     BlobFormat, BlobsProtocol, Hash,
 };
 use n0_future::{task::AbortOnDropHandle, FuturesUnordered, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::{select, sync::mpsc};
 use tracing::{error, trace};
@@ -145,6 +146,12 @@ pub struct CommonArgs {
 
     #[clap(long)]
     pub show_secret: bool,
+
+    /// Number of parallel jobs to use while importing files.
+    ///
+    /// Defaults to the number of logical CPU cores.
+    #[clap(short = 'j', long)]
+    pub jobs: Option<usize>,
 }
 
 /// Available command line options for configuring relays.
@@ -200,13 +207,13 @@ pub struct SendArgs {
 
     /// What type of ticket to use.
     ///
-    /// Use "id" for the shortest type only including the node ID,
+    /// Use "id" for the shortest type only including the endpoint ID,
     /// "addresses" to only add IP addresses without a relay url,
     /// "relay" to only add a relay address, and leave the option out
     /// to use the biggest type of ticket that includes both relay and
     /// address information.
     ///
-    /// Generally, the more information the higher the likelyhood of
+    /// Generally, the more information the higher the likelihood of
     /// a successful connection, but also the bigger a ticket to connect.
     ///
     /// This is most useful for debugging which methods of connection
@@ -232,7 +239,7 @@ pub struct ReceiveArgs {
     pub common: CommonArgs,
 }
 
-/// Options to configure what is included in a [`NodeAddr`]
+/// Options to configure what is included in a [`EndpointAddr`]
 #[derive(
     Copy,
     Clone,
@@ -246,33 +253,42 @@ pub struct ReceiveArgs {
     Deserialize,
 )]
 pub enum AddrInfoOptions {
-    /// Only the Node ID is added.
+    /// Only the Endpoint ID is added.
     ///
-    /// This usually means that iroh-dns discovery is used to find address information.
+    /// This usually means that iroh-dns address lookup is used to find address information.
     #[default]
     Id,
-    /// Includes the Node ID and both the relay URL, and the direct addresses.
+    /// Includes the Endpoint ID and both the relay URL, and the direct addresses.
     RelayAndAddresses,
-    /// Includes the Node ID and the relay URL.
+    /// Includes the Endpoint ID and the relay URL.
     Relay,
-    /// Includes the Node ID and the direct addresses.
+    /// Includes the Endpoint ID and the direct addresses.
     Addresses,
 }
 
-fn apply_options(addr: &mut NodeAddr, opts: AddrInfoOptions) {
+fn apply_options(addr: &mut EndpointAddr, opts: AddrInfoOptions) {
     match opts {
         AddrInfoOptions::Id => {
-            addr.direct_addresses.clear();
-            addr.relay_url = None;
+            addr.addrs = Default::default();
         }
         AddrInfoOptions::RelayAndAddresses => {
             // nothing to do
         }
         AddrInfoOptions::Relay => {
-            addr.direct_addresses.clear();
+            addr.addrs = addr
+                .addrs
+                .iter()
+                .filter(|addr| matches!(addr, TransportAddr::Relay(_)))
+                .cloned()
+                .collect();
         }
         AddrInfoOptions::Addresses => {
-            addr.relay_url = None;
+            addr.addrs = addr
+                .addrs
+                .iter()
+                .filter(|addr| matches!(addr, TransportAddr::Ip(_)))
+                .cloned()
+                .collect();
         }
     }
 }
@@ -284,7 +300,7 @@ fn get_or_create_secret(print: bool) -> anyhow::Result<SecretKey> {
     match std::env::var("IROH_SECRET") {
         Ok(secret) => SecretKey::from_str(&secret).context("invalid secret"),
         Err(_) => {
-            let key = SecretKey::generate(&mut rand::rng());
+            let key = SecretKey::generate();
             if print {
                 let key = hex::encode(key.to_bytes());
                 eprintln!("using secret key {key}");
@@ -358,8 +374,9 @@ async fn import(
     path: PathBuf,
     db: &Store,
     mp: &mut MultiProgress,
+    jobs: Option<usize>,
 ) -> anyhow::Result<(TempTag, u64, Collection)> {
-    let parallelism = num_cpus::get();
+    let parallelism = jobs.unwrap_or_else(num_cpus::get);
     let path = path.canonicalize()?;
     anyhow::ensure!(path.exists(), "path {} does not exist", path.display());
     let root = path.parent().context("context get parent")?;
@@ -518,7 +535,7 @@ async fn export(db: &Store, collection: Collection, mp: &mut MultiProgress) -> a
 
 #[derive(Debug)]
 struct PerConnectionProgress {
-    node_id: String,
+    endpoint_id: String,
     requests: BTreeMap<u64, ProgressBar>,
 }
 
@@ -530,9 +547,10 @@ async fn per_request_progress(
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
 ) {
     let pb = mp.add(ProgressBar::hidden());
-    let node_id = if let Some(connection) = connections.lock().unwrap().get_mut(&connection_id) {
+    let endpoint_id = if let Some(connection) = connections.lock().unwrap().get_mut(&connection_id)
+    {
         connection.requests.insert(request_id, pb.clone());
-        connection.node_id.clone()
+        connection.endpoint_id.clone()
     } else {
         error!("got request for unknown connection {connection_id}");
         return;
@@ -548,7 +566,7 @@ async fn per_request_progress(
             RequestUpdate::Started(msg) => {
                 pb.set_message(format!(
                     "n {} r {}/{} i {} # {}",
-                    node_id,
+                    endpoint_id,
                     connection_id,
                     request_id,
                     msg.index,
@@ -592,14 +610,14 @@ async fn show_provide_progress(
                 trace!("got event {item:?}");
                 match item {
                     ProviderMessage::ClientConnectedNotify(msg) => {
-                        let node_id = msg.node_id.map(|id| id.fmt_short().to_string()).unwrap_or_else(|| "?".to_string());
+                        let endpoint_id = msg.endpoint_id.map(|id| id.fmt_short().to_string()).unwrap_or_else(|| "?".to_string());
                         let connection_id = msg.connection_id;
                         eprintln!("Node {} connected with connection {}", node_id, connection_id);
                         connections.lock().unwrap().insert(
                             connection_id,
                             PerConnectionProgress {
                                 requests: BTreeMap::new(),
-                                node_id,
+                                endpoint_id,
                             },
                         );
                     }
@@ -637,18 +655,18 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     }
     // create a magicsocket endpoint
     let relay_mode: RelayMode = args.common.relay.into();
-    let mut builder = Endpoint::builder()
+    let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
         .secret_key(secret_key)
         .relay_mode(relay_mode.clone());
     if args.ticket_type == AddrInfoOptions::Id {
-        builder = builder.add_discovery(PkarrPublisher::n0_dns());
+        builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }
     if let Some(addr) = args.common.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = args.common.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
 
     // use a flat store - todo: use a partial in mem store instead
@@ -704,7 +722,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
             )),
         );
 
-        let import_result = import(path2, blobs.store(), &mut mp).await?;
+        let import_result = import(path2, blobs.store(), &mut mp, args.common.jobs).await?;
         let dt = t0.elapsed();
 
         let router = iroh::protocol::Router::builder(endpoint)
@@ -731,7 +749,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     let hash = temp_tag.hash();
 
     // make a ticket
-    let mut addr = router.endpoint().node_addr();
+    let mut addr = router.endpoint().addr();
     apply_options(&mut addr, args.ticket_type);
     let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq);
     let entry_type = if path.is_file() { "file" } else { "directory" };
@@ -991,21 +1009,21 @@ fn show_get_error(e: GetError) -> GetError {
 
 async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     let ticket = args.ticket;
-    let addr = ticket.node_addr().clone();
+    let addr = ticket.addr().clone();
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let mut builder = Endpoint::builder()
+    let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![])
         .secret_key(secret_key)
         .relay_mode(args.common.relay.into());
 
-    if ticket.node_addr().relay_url.is_none() && ticket.node_addr().direct_addresses.is_empty() {
-        builder = builder.add_discovery(DnsDiscovery::n0_dns());
+    if ticket.addr().relay_urls().next().is_none() && ticket.addr().ip_addrs().next().is_none() {
+        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }
     if let Some(addr) = args.common.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = args.common.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
     let endpoint = builder.bind().await?;
     eprintln!("Node id {}", endpoint.node_id());
@@ -1014,7 +1032,7 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     let db = iroh_blobs::store::fs::FsStore::load(&iroh_data_dir).await?;
     let db2 = db.clone();
     trace!("load done!");
-    let fut = async move {
+    let fut = async {
         trace!("running");
         let mut mp: MultiProgress = MultiProgress::new();
         let draw_target = if args.common.no_progress {
@@ -1107,8 +1125,12 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     };
     let (total_files, payload_size, stats) = select! {
         x = fut => match x {
-            Ok(x) => x,
+            Ok(x) => {
+                endpoint.close().await;
+                x
+            }
             Err(e) => {
+                endpoint.close().await;
                 // make sure we shutdown the db before exiting
                 db2.shutdown().await?;
                 eprintln!("error: {e}");
@@ -1116,6 +1138,7 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
             }
         },
         _ = tokio::signal::ctrl_c() => {
+            endpoint.close().await;
             db2.shutdown().await?;
             std::process::exit(130);
         }
