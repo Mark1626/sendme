@@ -60,7 +60,11 @@ use walkdir::WalkDir;
 /// You can also specify a port for the magicsocket. If you don't, a random one
 /// will be chosen.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_help = "Run `sendme <COMMAND> --help` to see all options for a command."
+)]
 pub struct Args {
     #[clap(subcommand)]
     pub command: Commands,
@@ -810,6 +814,13 @@ fn handle_key_press(set_clipboard: bool, ticket: BlobTicket) {
         add_to_clipboard(&ticket);
     }
 
+    // Without a terminal there are no key events to listen for, and polling
+    // the crossterm EventStream panics with "reader source not set".
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+
     let _keyboard = tokio::task::spawn(async move {
         println!("press c to copy command to clipboard, or use the --clipboard argument");
 
@@ -1049,6 +1060,29 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
             trace!("{} not complete", hash_and_format.hash);
             let cp = mp.add(make_connect_progress());
             let connection = endpoint.connect(addr, iroh_blobs::protocol::ALPN).await?;
+            let _watcher = AbortOnDropHandle::new(tokio::spawn({
+                let conn = connection.clone();
+                let mp = mp.clone();
+                async move {
+                    let mut paths = conn.paths_stream();
+                    let mut last = None;
+                    while let Some(list) = paths.next().await {
+                        let relay_path_selected = (&list)
+                            .into_iter()
+                            .find(|p| p.is_selected())
+                            .map(|p| p.is_relay());
+                        if relay_path_selected.is_some() && relay_path_selected != last {
+                            mp.println(if relay_path_selected == Some(true) {
+                                "connected via relay"
+                            } else {
+                                "connected directly"
+                            })
+                            .ok();
+                            last = relay_path_selected;
+                        }
+                    }
+                }
+            }));
             cp.finish_and_clear();
             let sp = mp.add(make_get_sizes_progress());
             let (_hash_seq, sizes) =
